@@ -1,0 +1,236 @@
+"""
+Iceberg Snapshot Expiry Auditor (Dry Run)
+
+Requirements
+------------
+pip install pyiceberg pandas
+
+Example
+-------
+python snapshot_auditor.py \
+    --catalog rest \
+    --uri http://localhost:8181 \
+    --warehouse warehouse \
+    --table demo.db.sales \
+    --expire-before "2025-01-01T00:00:00"
+
+Outputs
+-------
+audit_report.json
+"""
+
+import json
+import argparse
+from datetime import datetime, timezone
+from collections import defaultdict
+
+from pyiceberg.catalog import load_catalog
+
+
+# ----------------------------------------------------
+# Utility
+# ----------------------------------------------------
+
+def iso_to_millis(ts: str) -> int:
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return int(dt.timestamp() * 1000)
+
+
+def bytes_to_gb(size):
+    return round(size / (1024 ** 3), 3)
+
+
+# ----------------------------------------------------
+# Auditor
+# ----------------------------------------------------
+
+class SnapshotExpiryAuditor:
+
+    def __init__(self, table):
+        self.table = table
+
+    def collect_snapshot_metadata(self):
+
+        snapshots = []
+
+        metadata = self.table.metadata
+
+        for snapshot in metadata.snapshots:
+            snapshots.append({
+                "snapshot_id": snapshot.snapshot_id,
+                "parent_snapshot_id": snapshot.parent_snapshot_id,
+                "timestamp_ms": snapshot.timestamp_ms,
+                "manifest_list": str(snapshot.manifest_list),
+                "operation": snapshot.summary.get("operation", "UNKNOWN")
+                if snapshot.summary else "UNKNOWN"
+            })
+
+        return snapshots
+
+    def determine_expired_snapshots(self, expire_before_ms):
+
+        metadata = self.table.metadata
+
+        expired = []
+        retained = []
+
+        for snapshot in metadata.snapshots:
+
+            if snapshot.timestamp_ms < expire_before_ms:
+                expired.append(snapshot)
+
+            else:
+                retained.append(snapshot)
+
+        return expired, retained
+
+    def analyze_manifests(self, snapshots):
+
+        manifest_count = 0
+        manifest_bytes = 0
+
+        data_file_bytes = 0
+        data_file_count = 0
+
+        for snapshot in snapshots:
+
+            try:
+                manifests = self.table.inspect.manifests(snapshot.snapshot_id)
+
+                manifest_count += len(manifests)
+
+                for manifest in manifests:
+
+                    manifest_bytes += manifest.length
+
+                    entries = self.table.inspect.entries(manifest.path)
+
+                    for entry in entries:
+
+                        if entry.data_file is not None:
+
+                            data_file_count += 1
+                            data_file_bytes += entry.data_file.file_size_in_bytes
+
+            except Exception:
+                # inspection APIs vary slightly between versions
+                pass
+
+        return {
+            "manifest_count": manifest_count,
+            "manifest_bytes": manifest_bytes,
+            "manifest_gb": bytes_to_gb(manifest_bytes),
+            "data_file_count": data_file_count,
+            "data_file_bytes": data_file_bytes,
+            "data_file_gb": bytes_to_gb(data_file_bytes),
+        }
+
+    def generate_report(self, expire_before_ms):
+
+        expired, retained = self.determine_expired_snapshots(
+            expire_before_ms
+        )
+
+        expired_metrics = self.analyze_manifests(expired)
+        retained_metrics = self.analyze_manifests(retained)
+
+        report = {
+
+            "table": self.table.identifier,
+
+            "generated_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+            "expiry_timestamp_ms": expire_before_ms,
+
+            "summary": {
+
+                "total_snapshots":
+                    len(self.table.metadata.snapshots),
+
+                "snapshots_to_expire":
+                    len(expired),
+
+                "snapshots_retained":
+                    len(retained),
+
+                "estimated_reclaimable_bytes":
+                    expired_metrics["data_file_bytes"]
+                    + expired_metrics["manifest_bytes"],
+
+                "estimated_reclaimable_gb":
+                    bytes_to_gb(
+                        expired_metrics["data_file_bytes"]
+                        + expired_metrics["manifest_bytes"]
+                    ),
+            },
+
+            "expired_snapshot_metrics": expired_metrics,
+
+            "retained_snapshot_metrics": retained_metrics,
+
+            "expired_snapshots": [
+
+                {
+                    "snapshot_id": s.snapshot_id,
+                    "parent_snapshot_id": s.parent_snapshot_id,
+                    "timestamp_ms": s.timestamp_ms,
+                    "operation":
+                        s.summary.get("operation", "UNKNOWN")
+                        if s.summary else "UNKNOWN",
+                }
+
+                for s in expired
+            ]
+        }
+
+        return report
+
+
+# ----------------------------------------------------
+# CLI
+# ----------------------------------------------------
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--catalog", required=True)
+    parser.add_argument("--table", required=True)
+    parser.add_argument("--expire-before", required=True)
+
+    parser.add_argument("--uri")
+    parser.add_argument("--warehouse")
+
+    args = parser.parse_args()
+
+    properties = {}
+
+    if args.uri:
+        properties["uri"] = args.uri
+
+    if args.warehouse:
+        properties["warehouse"] = args.warehouse
+
+    catalog = load_catalog(
+        args.catalog,
+        **properties
+    )
+
+    table = catalog.load_table(args.table)
+
+    expire_before_ms = iso_to_millis(args.expire_before)
+
+    auditor = SnapshotExpiryAuditor(table)
+
+    report = auditor.generate_report(expire_before_ms)
+
+    with open("audit_report.json", "w") as f:
+        json.dump(report, f, indent=4)
+
+    print(json.dumps(report, indent=4))
+
+
+if __name__ == "__main__":
+    main()
